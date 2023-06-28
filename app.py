@@ -1,7 +1,10 @@
 ########################################################################################
-import gradio as gr
+#
 
+import gradio as gr
 import cv2
+import glob
+import json
 import matplotlib
 import matplotlib.cm
 import mediapipe as mp
@@ -16,246 +19,265 @@ from mediapipe.python.solutions.drawing_utils import _normalized_to_pixel_coordi
 from PIL import Image
 from quads import QUADS
 from typing import List, Mapping, Optional, Tuple, Union
-from utils import colorize, get_most_recent_subdirectory
 
-class face_image_to_face_mesh:
+from utils import colorize, get_most_recent_subdirectory
+from MediaMesh import *
+
+class FaceMeshWorkflow:
+    LOG = logging.getLogger(__name__)
+
+    IMAGE  = 'image'
+    LABEL  = 'label'
+    MESH   = 'mesh'
+    LO     = 'lo'     
+    HI     = 'hi'     
+    TO_LO  = 'toLo'   
+    TO_HI  = 'toHi'   
+    WEIGHT = 'weight'   
+    BUTTON = 'button' 
+
     def __init__(self):
-        self.zoe_me = True
-        self.uvwrap = not True
+        self.mm = mediaMesh = MediaMesh().demoSetup()
 
     def demo(self):
-        if self.zoe_me:
-            DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-            self.zoe = torch.hub.load('isl-org/ZoeDepth', "ZoeD_N", pretrained=True).to(DEVICE).eval()
-
-        demo = gr.Blocks(css=self.css(), cache_examples=True)
+        demo = gr.Blocks()
+        sources = {source:{} for source in 'mediapipe zoe midas'.split()}
+        flat_inn = []
+        flat_out = []
         with demo:
             gr.Markdown(self.header())
 
+            # image input and annotated output
+
             with gr.Row():
-                with gr.Column():
-                    upload_image = gr.Image(label="Input image", type="numpy", source="upload")
-                    self.temp_dir = get_most_recent_subdirectory( upload_image.DEFAULT_TEMP_DIR )
-                    print( f'The temp_dir is {self.temp_dir}' )
+                upload_image  = gr.Image(label="Input image", type="numpy", source="upload")
+                flat_inn.append( upload_image )
+                examples      = gr.Examples( examples=self.examples(), inputs=[upload_image] )
+                detect_button = gr.Button(value="Detect Faces")
+                faced_image   = self.img('faced image')
+                flat_out.append( faced_image )
 
-                    gr.Examples( examples=[
-                        'examples/blonde-00081-399357008.png',
-                        'examples/dude-00110-1227390728.png',
-                        'examples/granny-00056-1867315302.png',
-                        'examples/tuffie-00039-499759385.png',
-                        'examples/character.png',
-                    ], inputs=[upload_image] )
-                    upload_image_btn = gr.Button(value="Detect faces")
-                    if self.zoe_me:
-                        with gr.Group():
-                            zoe_scale = gr.Slider(label="Mix the ZoeDepth with the MediaPipe Depth", value=1, minimum=0, maximum=1, step=.01)
-                            flat_scale = gr.Slider(label="Depth scale, smaller is flatter and possibly more flattering", value=1, minimum=0, maximum=1, step=.01)
-                            min_detection_confidence = gr.Slider(label="Mininum face detection confidence", value=.5, minimum=0, maximum=1.0, step=0.01)
+            # per source widget sets
+
+            for name, source in sources.items():
+                with gr.Row():
+                    source[ FaceMeshWorkflow.LABEL ] = gr.Label(label=name, value=name)
+                with gr.Row():
+                    source[ FaceMeshWorkflow.IMAGE ] = self.img(f'{name} depth')
+                    with gr.Group():
+                        source[ FaceMeshWorkflow.LO     ] = gr.Label( label=f'{name}:Min', value=+33)
+                        source[ FaceMeshWorkflow.HI     ] = gr.Label( label=f'{name}:Max', value=-33)
+                        source[ FaceMeshWorkflow.TO_LO  ] = gr.Slider(label=f'{name}:Target Min', value=-.11, minimum=-3.3, maximum=3.3, step=0.01)
+                        source[ FaceMeshWorkflow.TO_HI  ] = gr.Slider(label=f'{name}:Target Max', value=+.11, minimum=-3.3, maximum=3.3, step=0.01)
+                        source[ FaceMeshWorkflow.BUTTON ] = gr.Button(value='Update Mesh')
+                    source[ FaceMeshWorkflow.MESH ] = self.m3d(name)
+
+            # the combined mesh with controls 
+
+            weights = []
+            with gr.Row():
+                with gr.Row():
+                    with gr.Column():
+                        for name, source in sources.items():
+                            source[ FaceMeshWorkflow.WEIGHT ] = gr.Slider(label=f'{name}:Source Weight', value=1, minimum=-1, maximum=1, step=0.01)
+                            weights.append( source[ FaceMeshWorkflow.WEIGHT ] )
+                        combine_button = gr.Button(value="Combined Meshes")
+                    with gr.Column():
+                        combined_mesh = self.m3d( 'combined' )
+                        flat_out.append( combined_mesh )
+
+            # setup the button clicks 
+
+            outties = {k:True for k in [ FaceMeshWorkflow.MESH, FaceMeshWorkflow.IMAGE, FaceMeshWorkflow.LO, FaceMeshWorkflow.HI]}
+            for name, source in sources.items():
+                update_inputs = []
+                update_outputs = [combined_mesh, source[FaceMeshWorkflow.MESH]]
+                for key, control in source.items():
+                    if key is FaceMeshWorkflow.BUTTON: 
+                        continue
+                    if key in outties:
+                        flat_out.append( control )
                     else:
-                        use_zoe = False
-                        zoe_scale = 0
-                    with gr.Group():
-                        gr.Markdown(self.footer())
+                        if not key is FaceMeshWorkflow.LABEL:
+                            flat_inn.append( control )
+                        update_inputs.append( control )
+                source[FaceMeshWorkflow.BUTTON].click( fn=self.remesh, inputs=update_inputs, outputs=update_outputs )
 
-                with gr.Column():
-                    with gr.Group():
-                        output_mesh = gr.Model3D(clear_color=3*[0],  label="3D Model",elem_id='mesh-display-output')
-                        output_image = gr.Image(label="Output image",elem_id='img-display-output')
-                        depth_image = gr.Image(label="Depth image",elem_id='img-display-output')
-                        num_faces_detected = gr.Number(label="Number of faces detected", value=0)
+            detect_button.click(  fn=self.detect,   inputs=flat_inn, outputs=flat_out )
+            combine_button.click( fn=self.combine,  inputs=weights, outputs=[combined_mesh] )
 
-            upload_image_btn.click(
-                fn=self.detect, 
-                inputs=[upload_image, min_detection_confidence,zoe_scale,flat_scale], 
-                outputs=[output_mesh, output_image, depth_image, num_faces_detected]
-            )
         demo.launch()
 
+    def detect(self, image:np.ndarray, mp_lo, mp_hi, mp_wt, zoe_lo, zoe_hi, zoe_wt, midas_lo, midas_hi, midas_wt):
+        self.mm.detect(image)
 
-    def detect(self, image, min_detection_confidence, zoe_scale, flat_scale):
-        width  = image.shape[1]
-        height = image.shape[0]
-        ratio  = width / height
+        self.mm.weightMap.values[ DepthMap.MEDIA_PIPE   ].weight = mp_wt
+        self.mm.weightMap.values[ ZoeDepthSource.NAME   ].weight = zoe_wt
+        self.mm.weightMap.values[ MidasDepthSource.NAME ].weight = midas_wt
 
-        mp_drawing = mp.solutions.drawing_utils
-        mp_drawing_styles = mp.solutions.drawing_styles
-        mp_face_mesh = mp.solutions.face_mesh
-            
-        mesh = "examples/converted/in-granny.obj"
+        self.mm.weightMap.values[ DepthMap.MEDIA_PIPE   ].toLo = mp_lo
+        self.mm.weightMap.values[ ZoeDepthSource.NAME   ].toLo = zoe_lo
+        self.mm.weightMap.values[ MidasDepthSource.NAME ].toLo = midas_lo
 
-        if self.zoe_me and 0 < zoe_scale:
-            depth = self.zoe.infer_pil(image)
-            idepth = colorize(depth, cmap='gray_r')
-        else:
-            depth = None
-            idepth = image
+        self.mm.weightMap.values[ DepthMap.MEDIA_PIPE   ].toHi = mp_hi
+        self.mm.weightMap.values[ ZoeDepthSource.NAME   ].toHi = zoe_hi
+        self.mm.weightMap.values[ MidasDepthSource.NAME ].toHi = midas_hi
 
-        drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
-        with mp_face_mesh.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=1,
-            min_detection_confidence=min_detection_confidence) as face_mesh:
-            results = face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-            if not results.multi_face_landmarks:
-                return mesh, image, idepth, 0
+        meshes = self.mm.meshmerizing()
 
-            annotated_image = image.copy()
-            for face_landmarks in results.multi_face_landmarks:
-                (mesh,mtl,png) = self.toObj(image=image, width=width, height=height, ratio=ratio, landmark_list=face_landmarks, depth=depth, zoe_scale=zoe_scale, flat_scale=flat_scale)
+        z = self.mm.depthSources[0]
+        m = self.mm.depthSources[1]
 
-                mp_drawing.draw_landmarks(
-                    image=annotated_image,
-                    landmark_list=face_landmarks,
-                    connections=mp_face_mesh.FACEMESH_TESSELATION,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=mp_drawing_styles
-                    .get_default_face_mesh_tesselation_style())
-                mp_drawing.draw_landmarks(
-                    image=annotated_image,
-                    landmark_list=face_landmarks,
-                    connections=mp_face_mesh.FACEMESH_CONTOURS,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=mp_drawing_styles
-                    .get_default_face_mesh_contours_style())
+        ##################################################################
 
-            return mesh, annotated_image, idepth, 1
+        annotated = self.mm.annotated
+        combined_mesh = meshes[MediaMesh.COMBINED][0]
 
-    def toObj( self, image: np.ndarray, width:int, height:int, ratio: float, landmark_list: landmark_pb2.NormalizedLandmarkList, depth: np.ndarray, zoe_scale: float, flat_scale: float):
-        print( f'you have such pretty hair', self.temp_dir )
+        mp_gray = self.mm.gray
+        mp_lo   = str(self.mm.weightMap.values[ DepthMap.MEDIA_PIPE ].lo)
+        mp_hi   = str(self.mm.weightMap.values[ DepthMap.MEDIA_PIPE ].hi)
+        mp_mesh = meshes[DepthMap.MEDIA_PIPE][0]
 
-        hf_hack = True
-        if hf_hack:
-            obj_file = tempfile.NamedTemporaryFile(suffix='.obj', delete=False)
-            mtl_file = tempfile.NamedTemporaryFile(suffix='.mtl', delete=False)
-            png_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-        else:
-            obj_file = tempfile.NamedTemporaryFile(suffix='.obj', dir=self.temp_dir, delete=False)
-            mtl_file = tempfile.NamedTemporaryFile(suffix='.mtl', dir=self.temp_dir, delete=False)
-            png_file = tempfile.NamedTemporaryFile(suffix='.png', dir=self.temp_dir, delete=False)
+        zoe_gray = z.gray
+        zoe_lo   = str(self.mm.weightMap.values[z.name].lo)
+        zoe_hi   = str(self.mm.weightMap.values[z.name].hi)
+        zoe_mesh = meshes[z.name][0]
 
-        ############################################
-        (points,coordinates,colors) = self.landmarksToPoints( image, width, height, ratio, landmark_list, depth, zoe_scale, flat_scale )
-        ############################################
+        midas_gray = m.gray
+        midas_lo   = str(self.mm.weightMap.values[m.name].lo)
+        midas_hi   = str(self.mm.weightMap.values[m.name].hi)
+        midas_mesh = meshes[m.name][0]
 
-        lines = []
+        ##################################################################
+        # gotta write 'em to disk for some reason
 
-        lines.append( f'o MyMesh' )
+        combined_mesh = self.writeMesh( MediaMesh.COMBINED, meshes[MediaMesh.COMBINED][0] )
+        mp_mesh       = self.writeMesh( DepthMap.MEDIA_PIPE, meshes[DepthMap.MEDIA_PIPE][0] )
+        zoe_mesh      = self.writeMesh( z.name, meshes[z.name][0] )
+        midas_mesh    = self.writeMesh( m.name, meshes[m.name][0] )
 
-        if hf_hack:
-            # the 'file=' is a gradio hack
-            lines.append( f'#mtllib file={mtl_file.name}' )
-        else:
-            # the 'file=' is a gradio hack
-            lines.append( f'mtllib file={mtl_file.name}' )
+        ##################################################################
+        # [image, model3d, (image, label, label, model3d), (image, label, label, model3d), (image, label, label, model3d)]
 
-        for index, point in enumerate(points):
-            color = colors[index]
-            scaled_color = [value / 255 for value in color]  # Scale colors down to 0-1 range
-            flipped = [-value for value in point]
-            flipped[ 0 ] = -flipped[ 0 ]
-            lines.append( "v " + " ".join(map(str, flipped + color)) )
+        return annotated, combined_mesh, mp_gray, mp_lo, mp_hi, mp_mesh, zoe_gray, zoe_lo, zoe_hi, zoe_mesh, midas_gray, midas_lo, midas_hi, midas_mesh
 
-        for coordinate in coordinates:
-            lines.append( "vt " + " ".join([str(value) for value in coordinate]) )
+    def combine(self, mp_wt, zoe_wt, midas_wt ):
+        self.mm.weightMap.values[ DepthMap.MEDIA_PIPE   ].weight = mp_wt
+        self.mm.weightMap.values[ ZoeDepthSource.NAME   ].weight = zoe_wt
+        self.mm.weightMap.values[ MidasDepthSource.NAME ].weight = midas_wt
+        return self.writeMesh(MediaMesh.COMBINED, self.mm.toObj(MediaMesh.COMBINED)[0])
 
-        for quad in QUADS:
-            #quad = list(reversed(quad))
-            normal = self.totallyNormal( points[ quad[ 0 ] -1 ], points[ quad[ 1 ] -1 ], points[ quad[ 2 ] -1 ] )
-            lines.append( "vn " + " ".join([str(value) for value in normal]) )
+    def kombine(self, image:np.ndarray, mp_lo, mp_hi, mp_wt, zoe_lo, zoe_hi, zoe_wt, midas_lo, midas_hi, midas_wt):
+        self.mm.weightMap.values[ DepthMap.MEDIA_PIPE   ].weight = mp_wt
+        self.mm.weightMap.values[ ZoeDepthSource.NAME   ].weight = zoe_wt
+        self.mm.weightMap.values[ MidasDepthSource.NAME ].weight = midas_wt
 
-        lines.append( 'usemtl MyMaterial' )
+        self.mm.weightMap.values[ DepthMap.MEDIA_PIPE   ].toLo = mp_lo
+        self.mm.weightMap.values[ ZoeDepthSource.NAME   ].toLo = zoe_lo
+        self.mm.weightMap.values[ MidasDepthSource.NAME ].toLo = midas_lo
 
-        quadIndex = 0
-        for quad in QUADS:
-            quadIndex = 1 + quadIndex
-            face_uv = "f " + " ".join([f'{vertex}/{vertex}/{quadIndex}' for vertex in quad])
-            face_un = "f " + " ".join([str(vertex) for vertex in quad])
-            if self.uvwrap:
-                lines.append( face_uv )
-            else:
-                lines.append( f'#{face_uv}' )
-                lines.append( f'{face_un}' )
-                #"f " + " ".join([str(vertex) for vertex in quad]) )
+        self.mm.weightMap.values[ DepthMap.MEDIA_PIPE   ].toHi = mp_hi
+        self.mm.weightMap.values[ ZoeDepthSource.NAME   ].toHi = zoe_hi
+        self.mm.weightMap.values[ MidasDepthSource.NAME ].toHi = midas_hi
 
-        out = open( obj_file.name, 'w' )
-        out.write( '\n'.join( lines ) + '\n' )
+        meshes = self.mm.meshmerizing()
+
+        z = self.mm.depthSources[0]
+        m = self.mm.depthSources[1]
+
+        ##################################################################
+
+        annotated = self.mm.annotated
+        combined_mesh = meshes[MediaMesh.COMBINED][0]
+
+        mp_gray = self.mm.gray
+        mp_lo   = str(self.mm.weightMap.values[ DepthMap.MEDIA_PIPE ].lo)
+        mp_hi   = str(self.mm.weightMap.values[ DepthMap.MEDIA_PIPE ].hi)
+        mp_mesh = meshes[DepthMap.MEDIA_PIPE][0]
+
+        zoe_gray = z.gray
+        zoe_lo   = str(self.mm.weightMap.values[z.name].lo)
+        zoe_hi   = str(self.mm.weightMap.values[z.name].hi)
+        zoe_mesh = meshes[z.name][0]
+
+        midas_gray = m.gray
+        midas_lo   = str(self.mm.weightMap.values[m.name].lo)
+        midas_hi   = str(self.mm.weightMap.values[m.name].hi)
+        midas_mesh = meshes[m.name][0]
+
+        ##################################################################
+        # gotta write 'em to disk for some reason
+
+        combined_mesh = self.writeMesh( MediaMesh.COMBINED, meshes[MediaMesh.COMBINED][0] )
+        mp_mesh       = self.writeMesh( DepthMap.MEDIA_PIPE, meshes[DepthMap.MEDIA_PIPE][0] )
+        zoe_mesh      = self.writeMesh( z.name, meshes[z.name][0] )
+        midas_mesh    = self.writeMesh( m.name, meshes[m.name][0] )
+
+        ##################################################################
+        # [image, model3d, (image, label, label, model3d), (image, label, label, model3d), (image, label, label, model3d)]
+
+        return annotated, combined_mesh, mp_gray, mp_lo, mp_hi, mp_mesh, zoe_gray, zoe_lo, zoe_hi, zoe_mesh, midas_gray, midas_lo, midas_hi, midas_mesh
+
+    def remesh(self, label:Dict[str,str], lo:float, hi:float, wt:float):
+        name = label[ 'label' ] # hax
+        FaceMeshWorkflow.LOG.info( f'remesh {name} with lo:{lo}, hi:{hi} and wt:{wt}' )
+
+        self.mm.weightMap.values[ name ].toLo = lo
+        self.mm.weightMap.values[ name ].toHi = hi
+        self.mm.weightMap.values[ name ].weight = wt
+
+        mesh     = self.writeMesh(name,               self.mm.singleSourceMesh(name)[0])
+        combined = self.writeMesh(MediaMesh.COMBINED, self.mm.toObj(MediaMesh.COMBINED)[0])
+
+        return mesh, combined
+    
+    def writeMesh(self, name:str, mesh:List[str])->str:
+        file = tempfile.NamedTemporaryFile(suffix='.obj', delete=False).name
+        out = open( file, 'w' )
+        out.write( '\n'.join( mesh ) + '\n' )
         out.close()
+        return file
 
-        ############################################
+    def detective(self, *args):
+        for arg in args:
+            wat = 'TMI' if isinstance(arg, np.ndarray) else arg
+            #c = '#' if hf_hack else ''
+            print( f'hi there {type(arg)} ur a nice {wat} to have ' )
+        return None
 
-        lines = []
-        lines.append( 'newmtl MyMaterial' )
-        lines.append( f'map_Kd file={png_file.name}' ) # the 'file=' is a gradio hack
+    def m3d(self, name:str):
+        return gr.Model3D(clear_color=3*[0],  label=f"{name} mesh", elem_id='mesh-display-output')
 
-        out = open( mtl_file.name, 'w' )
-        out.write( '\n'.join( lines ) + '\n' )
-        out.close()
+    def img(self, name:str, src:str='upload'):
+        return gr.Image(label=name,elem_id='img-display-output',source=src)
 
-        ############################################
-
-        cv2.imwrite(png_file.name, cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-
-        ############################################
-
-        print( f'I know it is special to you so I saved it to {obj_file.name} since we are friends' )
-        return (obj_file.name,mtl_file.name,png_file.name)
-
-    def landmarksToPoints( self, image:np.ndarray, width: int, height: int, ratio: float, landmark_list: landmark_pb2.NormalizedLandmarkList, depth: np.ndarray, zoe_scale: float, flat_scale: float ):
-        points      = [] # 3d vertices
-        coordinates = [] # 2d texture coordinates
-        colors      = [] # 3d rgb info
-
-        mins = [+np.inf] * 3
-        maxs = [-np.inf] * 3
-
-        mp_scale = 1 - zoe_scale
-        print( f'zoe_scale:{zoe_scale}, mp_scale:{mp_scale}' )
-
-        for idx, landmark in enumerate(landmark_list.landmark):
-            x, y = _normalized_to_pixel_coordinates(landmark.x,landmark.y,width,height)
-            color = image[y,x]
-            colors.append( [value / 255 for value in color ] )
-            coordinates.append( [x/width,1-y/height] )
-
-            if depth is not None:
-                landmark.z = depth[y, x] * zoe_scale + mp_scale * landmark.z
-
-            landmark.z = landmark.z * flat_scale
-
-            point = [landmark.x * ratio, landmark.y, landmark.z];
-            for pidx,value in enumerate( point ):
-                mins[pidx] = min(mins[pidx],value)
-                maxs[pidx] = max(maxs[pidx],value)
-            points.append( point )
-
-        mids = [(min_val + max_val) / 2 for min_val, max_val in zip(mins, maxs)]
-        for idx,point in enumerate( points ):
-            points[idx] = [(val-mid) for val, mid in zip(point,mids)]
-
-        print( f'mins: {mins}' )
-        print( f'mids: {mids}' )
-        print( f'maxs: {maxs}' )
-        return (points,coordinates,colors)
-
-
-    def totallyNormal(self, p0, p1, p2):
-        v1 = np.array(p1) - np.array(p0)
-        v2 = np.array(p2) - np.array(p0)
-        normal = np.cross(v1, v2)
-        normal = normal / np.linalg.norm(normal)
-        return normal.tolist()    
-
+    def examples(self) -> List[str]:
+        return glob.glob('examples/*png')
+        return [
+            'examples/blonde-00081-399357008.png',
+            'examples/dude-00110-1227390728.png',
+            'examples/granny-00056-1867315302.png',
+            'examples/tuffie-00039-499759385.png',
+            'examples/character.png',
+        ]
 
     def header(self):
         return ("""
-                # Image to Quad Mesh
+                # FaceMeshWorkflow
 
-                Uses MediaPipe to detect a face in an image and convert it to a quad mesh.
-                Saves to OBJ since gltf does not support quad faces.  The 3d viewer has Y pointing the opposite direction from Blender, so ya hafta spin it.
+                The process goes like this:
 
-                The face depth with Zoe can be a bit much and without it is a bit generic. In blender you can fix this just by snapping to the high poly model. For photos turning it down to .4 helps, but may still need cleanup...
+                1. select an input images
+                2. click "Detect Faces"
+                3. fine tune the different depth sources
+                4. fine tune the combinations of the depth sources
+                5. download the obj and have fun
 
-                Highly recommend running it locally. The 3D model has uv values in the faces, but you will have to either use the script or do some manually tomfoolery.
+                The primary motivation was that all the MediaPipe faces all looked the same.
+                Usually ZoeDepth is usually better, but can be extreme. Midas works sometimes :-P
+
+                The depth analysis is a bit slow. Especially on the hf site, so I recommend running it locally.
+                Since the tuning is a post-process to the analysis you can go nuts!
 
                 Quick import result in examples/converted/movie-gallery.mp4 under files
         """)
@@ -286,6 +308,8 @@ class face_image_to_face_mesh:
             
             This is all a work around for a weird hf+gradios+babylonjs bug which seems to be related to the version
             of babylonjs being used... It works fine in a local babylonjs sandbox...
+
+			If you forget, the .obj has notes on how to mangle it.
             
             # Suggested Workflows
             
@@ -309,31 +333,15 @@ class face_image_to_face_mesh:
             1. generate a face in sd
             2. generate the mesh
             3. repose it and use it for further generation
+
+			An extension would be hoopy
             
-            May need to expanded the generated mesh to cover more, maybe with
+            May want to expanded the generated mesh to cover more, maybe with
             <a href="https://github.com/shunsukesaito/PIFu" target="_blank">PIFu model</a>.
-            
         """)
+ 
 
-
-    def css(self):
-       return ("""
-            #mesh-display-output {
-                max-height: 44vh;
-                max-width:  44vh;
-                width:auto;
-                height:auto
-                }
-            #img-display-output {
-                max-height: 28vh;
-                max-width:  28vh;
-                width:auto;
-                height:auto
-                }
-        """)
-
-
-face_image_to_face_mesh().demo()
+FaceMeshWorkflow().demo()
 
 # EOF
 ########################################################################################
