@@ -1,0 +1,3 @@
+newmtl MyMaterial
+illum 2
+map_Kd dude.png
