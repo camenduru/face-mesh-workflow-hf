@@ -17,14 +17,14 @@ _meshin_around_main() {
 		echo "${mash} already exists"
 	else
 		echo "creating ${mash} for ${mesh}"
-		sed "s,^f.*,,;s,#f,f,;s,.*mtllib.*,mtllib ${mtl}," ${mesh} > ${mash} || exit ${?}
+		sed "s,^f.*,,;s,#f,f,;s,.*mtllib.*,mtllib ${mtl},;s,^usemtl .*,usemtl ${name}Material," ${mesh} > ${mash} || exit ${?}
 	fi
 
 	if [ -f "${mtl}" ] ; then 
 		echo "${mtl} already exists"
 	else
 		echo "creating ${mtl} for ${mash}"
-		echo -e "newmtl MyMaterial\nmap_Kd ${png}" > ${mtl} || exit ${?}
+		echo -e "newmtl ${name}Material\nmap_Kd ${png}" > ${mtl} || exit ${?}
 	fi
 
 	if [ -f "${png}" ] ; then
