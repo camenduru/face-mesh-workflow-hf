@@ -1,5 +1,5 @@
 ---
-title: Face Image to Face Quad Mesh
+title: Face Mesh Workflow
 emoji: 🐢
 colorFrom: red
 colorTo: pink
@@ -10,8 +10,7 @@ pinned: false
 duplicated_from: verkaDerkaDerk/face-image-to-face-obj
 ---
 
-Uses MediaPipe to detect a face in an image and convert it to a (mostly) quad mesh.
-Currently saves to OBJ, hopefully glb at some point with color data.
+Uses MediaPipe to detect a face in an image the allows you to combined it's depth estimation with those from Zoe and Midas.
 The 3d viewer has Y pointing the opposite direction from Blender, so ya hafta spin it.
 
 Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
